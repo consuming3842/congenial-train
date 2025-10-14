@@ -1,0 +1,243 @@
+# GitLab CI/CD configuration converted from GitHub Actions
+# This file combines both build.yml and build-disk.yml functionality
+
+stages:
+  - build
+  - build-disk
+
+variables:
+  IMAGE_DESC: "My Customized Universal Blue Image"
+  IMAGE_KEYWORDS: "bootc,ublue,universal-blue"
+  IMAGE_LOGO_URL: "https://avatars.githubusercontent.com/u/120078124?s=200&v=4"
+  IMAGE_NAME: "${CI_PROJECT_NAME}"
+  IMAGE_REGISTRY: "${CI_REGISTRY}/${CI_PROJECT_NAMESPACE}"
+  DEFAULT_TAG: "latest"
+  DOCKER_BUILDKIT: 1
+  DOCKER_DRIVER: overlay2
+  BIB_IMAGE: "ghcr.io/lorbuschris/bootc-image-builder:20250608"
+
+# Build and push container image
+build_push:
+  stage: build
+  image: 
+    name: quay.io/buildah/stable:latest
+    entrypoint: [""]
+  
+  services:
+    - docker:dind
+  
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  
+  before_script:
+    # Prepare environment
+    - export IMAGE_REGISTRY=$(echo "${IMAGE_REGISTRY}" | tr '[:upper:]' '[:lower:]')
+    - export IMAGE_NAME=$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
+    
+    # Install necessary tools
+    - dnf install -y git podman buildah
+    
+    # Get current date for metadata
+    - export BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    
+  script:
+    # Generate tags
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        export TAGS="${DEFAULT_TAG}-mr${CI_MERGE_REQUEST_IID} ${CI_COMMIT_SHORT_SHA}"
+      else
+        export BUILD_DATE_SHORT=$(date -u +%Y%m%d)
+        export TAGS="${DEFAULT_TAG} ${DEFAULT_TAG}.${BUILD_DATE_SHORT} ${BUILD_DATE_SHORT}"
+      fi
+    
+    # Build container image using buildah
+    - |
+      buildah build \
+        --file ./Containerfile \
+        --tag "${IMAGE_NAME}:${DEFAULT_TAG}" \
+        --label "io.artifacthub.package.readme-url=https://gitlab.com/${CI_PROJECT_PATH}/-/raw/main/README.md" \
+        --label "org.opencontainers.image.created=${BUILD_DATE}" \
+        --label "org.opencontainers.image.description=${IMAGE_DESC}" \
+        --label "org.opencontainers.image.documentation=https://gitlab.com/${CI_PROJECT_PATH}/-/raw/main/README.md" \
+        --label "org.opencontainers.image.source=https://gitlab.com/${CI_PROJECT_PATH}/-/blob/main/Containerfile" \
+        --label "org.opencontainers.image.title=${IMAGE_NAME}" \
+        --label "org.opencontainers.image.url=https://gitlab.com/${CI_PROJECT_PATH}" \
+        --label "org.opencontainers.image.vendor=${CI_PROJECT_NAMESPACE}" \
+        --label "org.opencontainers.image.version=${DEFAULT_TAG}.$(date -u +%Y%m%d)" \
+        --label "io.artifacthub.package.deprecated=false" \
+        --label "io.artifacthub.package.keywords=${IMAGE_KEYWORDS}" \
+        --label "io.artifacthub.package.license=Apache-2.0" \
+        --label "io.artifacthub.package.logo-url=${IMAGE_LOGO_URL}" \
+        --label "io.artifacthub.package.prerelease=false" \
+        --label "containers.bootc=1" \
+        .
+    
+    # Login to GitLab Container Registry (only when not in merge request)
+    - |
+      if [ "$CI_PIPELINE_SOURCE" != "merge_request_event" ] && [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        echo "${CI_REGISTRY_PASSWORD}" | buildah login -u "${CI_REGISTRY_USER}" --password-stdin "${CI_REGISTRY}"
+        
+        # Tag and push images
+        for tag in ${TAGS}; do
+          buildah tag "${IMAGE_NAME}:${DEFAULT_TAG}" "${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}"
+          buildah push "${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}"
+        done
+        echo "Images pushed to registry"
+      else
+        echo "Skipping registry push for merge request or non-main branch"
+      fi
+  
+  rules:
+    # Run on merge requests to main
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    # Run on pushes to main branch (exclude README changes)
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - "**/*"
+    # Run on manual trigger
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    # Run on schedule
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# Build disk images job
+build_disk_images:
+  stage: build-disk
+  image: ubuntu:24.04
+  
+  # Use matrix strategy for different disk types
+  parallel:
+    matrix:
+      - DISK_TYPE: ["qcow2", "anaconda-iso"]
+        PLATFORM: ["amd64"]
+  
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: "/certs"
+  
+  services:
+    - docker:dind
+  
+  before_script:
+    # Prepare environment
+    - export USER_UID=$(id -u)
+    - export USER_GID=$(id -g)
+    - export IMAGE_REGISTRY=$(echo "${IMAGE_REGISTRY}" | tr '[:upper:]' '[:lower:]')
+    - export IMAGE_NAME=$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
+    
+    # Install dependencies
+    - apt-get update -y
+    - apt-get install -y wget curl git podman
+    
+    # Install Docker if not available
+    - |
+      if ! command -v docker &> /dev/null; then
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sh get-docker.sh
+      fi
+  
+  script:
+    # Determine config file based on disk type
+    - |
+      if [ "${DISK_TYPE}" = "anaconda-iso" ]; then
+        export CONFIG_FILE="./disk_config/iso.toml"
+      else
+        export CONFIG_FILE="./disk_config/disk.toml"
+      fi
+    
+    # Build disk images using bootc-image-builder
+    # Note: This is a simplified version since GitLab doesn't have the exact equivalent action
+    - |
+      docker run --rm --privileged \
+        -v "$(pwd)":/workspace \
+        -v /var/lib/containers/storage:/var/lib/containers/storage \
+        "${BIB_IMAGE}" \
+        --type "${DISK_TYPE}" \
+        --config "${CONFIG_FILE}" \
+        --use-librepo=True \
+        "${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}"
+    
+    # Set proper ownership of generated files
+    - chown -R "${USER_UID}:${USER_GID}" ./output || true
+  
+  artifacts:
+    paths:
+      - output/
+    expire_in: 1 day
+    when: always
+  
+  rules:
+    # Run on manual trigger with platform selection
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      variables:
+        PLATFORM: "${PLATFORM_CHOICE:-amd64}"
+        UPLOAD_TO_S3: "${UPLOAD_TO_S3_CHOICE:-false}"
+    
+    # Run on merge requests to main when specific paths change
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      changes:
+        - "./disk_config/disk.toml"
+        - "./disk_config/iso.toml"
+        - ".gitlab-ci.yml"
+
+# Optional: Upload to S3 job (runs after build if enabled)
+upload_to_s3:
+  stage: build-disk
+  image: ubuntu:24.04
+  
+  dependencies:
+    - build_disk_images
+  
+  before_script:
+    - apt-get update -y
+    - apt-get install -y rclone
+  
+  script:
+    - |
+      rclone copy output/ "s3:${S3_BUCKET_NAME}/" \
+        --s3-provider "${S3_PROVIDER}" \
+        --s3-access-key-id "${S3_ACCESS_KEY_ID}" \
+        --s3-secret-access-key "${S3_SECRET_ACCESS_KEY}" \
+        --s3-region "${S3_REGION}" \
+        --s3-endpoint "${S3_ENDPOINT}"
+  
+  rules:
+    # Only run when UPLOAD_TO_S3 is true and not on merge requests
+    - if: '$UPLOAD_TO_S3 == "true" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+  
+  variables:
+    # These should be set as protected variables in GitLab CI/CD settings
+    S3_PROVIDER: "${S3_PROVIDER}"
+    S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID}"
+    S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY}"
+    S3_REGION: "${S3_REGION}"
+    S3_ENDPOINT: "${S3_ENDPOINT}"
+    S3_BUCKET_NAME: "${S3_BUCKET_NAME}"
+
+# ARM64 specific build (if needed)
+build_disk_images_arm64:
+  extends: build_disk_images
+  
+  tags:
+    - arm64  # Requires arm64 runner to be configured
+  
+  parallel:
+    matrix:
+      - DISK_TYPE: ["qcow2", "anaconda-iso"]
+        PLATFORM: ["arm64"]
+  
+  before_script:
+    # ARM64 specific setup
+    - export USER_UID=$(id -u)
+    - export USER_GID=$(id -g)
+    - export IMAGE_REGISTRY=$(echo "${IMAGE_REGISTRY}" | tr '[:upper:]' '[:lower:]')
+    - export IMAGE_NAME=$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
+    
+    # Install dependencies for ARM64
+    - apt-get update -y
+    - apt-get install -y podman curl git
+  
+  rules:
+    - if: '$PLATFORM_CHOICE == "arm64" && $CI_PIPELINE_SOURCE == "web"'
